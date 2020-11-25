@@ -15,7 +15,6 @@ import org.eclipse.aether.spi.connector.layout.RepositoryLayoutProvider;
 import org.eclipse.aether.spi.connector.transport.TransporterProvider;
 import org.eclipse.aether.spi.io.FileProcessor;
 import org.eclipse.aether.transfer.NoRepositoryConnectorException;
-import org.eclipse.transformer.jakarta.JakartaTransformer;
 
 import javax.inject.Inject;
 import java.io.File;
@@ -77,7 +76,10 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                     System.out.println(i.getFile());
                     try {
                         if (i.getArtifact().getExtension().equals("jar")) {
-                            JakartaTransformer.main(new String[]{toTransform.getAbsolutePath(), entry.getValue().getAbsolutePath()});
+                            ReverseJakartaTransformer.main(new String[]{toTransform.getAbsolutePath(), entry.getValue().getAbsolutePath()});
+                        } else if (i.getArtifact().getExtension().equals("pom")) {
+                            entry.getValue().getParentFile().mkdirs();
+                            Files.copy(toTransform.toPath(), entry.getValue().toPath());
                         } else {
                             entry.getValue().getParentFile().mkdirs();
                             Files.copy(toTransform.toPath(), entry.getValue().toPath());
