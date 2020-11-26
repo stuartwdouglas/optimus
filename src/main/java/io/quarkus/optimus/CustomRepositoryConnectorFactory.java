@@ -15,15 +15,36 @@ import org.eclipse.aether.spi.connector.layout.RepositoryLayoutProvider;
 import org.eclipse.aether.spi.connector.transport.TransporterProvider;
 import org.eclipse.aether.spi.io.FileProcessor;
 import org.eclipse.aether.transfer.NoRepositoryConnectorException;
+import org.eclipse.transformer.jakarta.JakartaTransformer;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
 
 import javax.inject.Inject;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
 import java.io.File;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component(role = RepositoryConnectorFactory.class, hint = "custom")
 public class CustomRepositoryConnectorFactory implements RepositoryConnectorFactory {
@@ -76,10 +97,38 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                     System.out.println(i.getFile());
                     try {
                         if (i.getArtifact().getExtension().equals("jar")) {
-                            ReverseJakartaTransformer.main(new String[]{toTransform.getAbsolutePath(), entry.getValue().getAbsolutePath()});
+                            entry.getValue().getParentFile().mkdirs();
+                            JakartaTransformer.main(new String[]{toTransform.getAbsolutePath(), entry.getValue().getAbsolutePath()});
+
+                            URI uri = new URI("jar:" + entry.getValue().toURI().toASCIIString());
+                            try (FileSystem zipfs = FileSystems.newFileSystem(uri, new HashMap<>())) {
+                                Path e = zipfs.getPath("META-INF/quarkus-extension.properties");
+                                if (Files.exists(e)) {
+                                    Properties p = new Properties();
+                                    try (InputStream in = Files.newInputStream(e)) {
+                                        p.load(in);
+                                    }
+                                    Object val = p.get("deployment-artifact");
+                                    if (val != null) {
+                                        p.setProperty("deployment-artifact", val.toString() + SUFFIX);
+                                    }
+                                    try (OutputStream out = Files.newOutputStream(e)) {
+                                        p.store(out, "");
+                                    }
+                                }
+                            }
                         } else if (i.getArtifact().getExtension().equals("pom")) {
                             entry.getValue().getParentFile().mkdirs();
-                            Files.copy(toTransform.toPath(), entry.getValue().toPath());
+                            String pomFile = new String(Files.readAllBytes(toTransform.toPath()), StandardCharsets.UTF_8);
+                            modifyPomFile(toTransform, entry.getValue());
+                            Matcher m = Pattern.compile("<version>(.*?)</version>").matcher(pomFile);
+                            StringBuffer sb = new StringBuffer();
+                            while (m.find()) {
+                                m.appendReplacement(sb, "<version>$1" + "-\\$\\$jakarta9\\$\\$</version>");
+                            }
+                            m.appendTail(sb);
+                            Files.write(entry.getValue().toPath(), sb.toString().getBytes(StandardCharsets.UTF_8));
+                            //Files.copy(toTransform.toPath(), entry.getValue().toPath());
                         } else {
                             entry.getValue().getParentFile().mkdirs();
                             Files.copy(toTransform.toPath(), entry.getValue().toPath());
@@ -88,6 +137,72 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                         throw new RuntimeException(e);
                     }
                 }
+            }
+
+            private void modifyPomFile(File source, File target) {
+                try {
+
+                    DocumentBuilderFactory documentBuilderFactory = DocumentBuilderFactory.newInstance();
+
+                    DocumentBuilder documentBuilder = documentBuilderFactory.newDocumentBuilder();
+
+                    Document document = documentBuilder.parse(source);
+
+                    NodeList mainNodes = document.getFirstChild().getChildNodes();
+
+                    for (int nc = 0; nc < mainNodes.getLength(); ++nc) {
+                        Node node = mainNodes.item(nc);
+                        if (node instanceof Element) {
+                            Element element = (Element) node;
+                            switch (node.getNodeName()) {
+                                case "parent":
+                                    handleParent(element);
+                                    break;
+                                case "dependencies":
+                                    handleDependencies(element);
+                                    break;
+                                case "dependencyManagement":
+                                    handleDependencies((Element) element.getElementsByTagName("dependencies").item(0));
+                                    break;
+
+                            }
+                        }
+                    }
+
+                    // write the DOM object to the file
+                    TransformerFactory transformerFactory = TransformerFactory.newInstance();
+
+                    Transformer transformer = transformerFactory.newTransformer();
+                    DOMSource domSource = new DOMSource(document);
+
+                    StreamResult streamResult = new StreamResult(target);
+                    transformer.transform(domSource, streamResult);
+
+                } catch (Exception pce) {
+                    throw new RuntimeException(pce);
+                }
+
+            }
+
+            private void handleDependencies(Element element) {
+                NodeList deps = element.getElementsByTagName("dependency");
+                for (int nc = 0; nc < deps.getLength(); ++nc) {
+                    Element dep = (Element) deps.item(nc);
+                    Node groupId = dep.getElementsByTagName("groupId").item(0);
+                    Node artifactId = dep.getElementsByTagName("artifactId").item(0);
+                    NodeList versions = dep.getElementsByTagName("version");
+                    Node version = versions.getLength() > 0 ? versions.item(0) : null;
+                    String group = groupId.getTextContent();
+                    String artifact = artifactId.getTextContent();
+                    if (version != null) {
+                        dep.setTextContent(dep.getTextContent() + SUFFIX);
+                    }
+                }
+            }
+
+            private void handleParent(Element node) {
+                Node version = node.getElementsByTagName("version").item(0);
+                version.setTextContent(version.getTextContent() + SUFFIX);
             }
 
             @Override
