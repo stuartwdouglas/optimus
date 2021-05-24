@@ -123,8 +123,17 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                             modifyPomFile(toTransform, entry.getValue());
                             Matcher m = Pattern.compile("<version>(.*?)</version>").matcher(pomFile);
                             StringBuffer sb = new StringBuffer();
+                            StringBuffer lineBuf = new StringBuffer();
+                            int indx = 0;
                             while (m.find()) {
-                                m.appendReplacement(sb, "<version>$1" + "-\\$\\$jakarta9\\$\\$</version>");
+                                m.appendReplacement(lineBuf, "<version>$1" + "-\\$\\$jakarta9\\$\\$</version>");
+                                if ((indx = lineBuf.toString().lastIndexOf("<version>${project.version}-$$jakarta9$$</version>")) > 0) {
+                                    sb.append(lineBuf.toString().substring(0, indx-1));
+                                    sb.append("<version>${project.version}</version>");
+                                } else {
+                                    sb.append(lineBuf);
+                                }
+                                lineBuf.delete(0, lineBuf.length());
                             }
                             m.appendTail(sb);
                             Files.write(entry.getValue().toPath(), sb.toString().getBytes(StandardCharsets.UTF_8));
