@@ -1,8 +1,15 @@
 package io.quarkus.optimus;
 
 import org.codehaus.plexus.component.annotations.Component;
+import org.eclipse.aether.RepositorySystem;
 import org.eclipse.aether.RepositorySystemSession;
+import org.eclipse.aether.collection.CollectRequest;
+import org.eclipse.aether.collection.CollectResult;
+import org.eclipse.aether.collection.DependencyCollectionException;
 import org.eclipse.aether.connector.basic.BasicRepositoryConnectorFactory;
+import org.eclipse.aether.graph.Dependency;
+import org.eclipse.aether.graph.DependencyNode;
+import org.eclipse.aether.graph.DependencyVisitor;
 import org.eclipse.aether.repository.RemoteRepository;
 import org.eclipse.aether.spi.connector.ArtifactDownload;
 import org.eclipse.aether.spi.connector.ArtifactUpload;
@@ -50,14 +57,18 @@ import java.util.regex.Pattern;
 public class CustomRepositoryConnectorFactory implements RepositoryConnectorFactory {
 
     public static final String SUFFIX = "-$$jakarta9$$";
-    BasicRepositoryConnectorFactory factory = new BasicRepositoryConnectorFactory();
+    final BasicRepositoryConnectorFactory factory = new BasicRepositoryConnectorFactory();
+
+    final RepositorySystem repositorySystem;
+
 
     @Inject
-    CustomRepositoryConnectorFactory(TransporterProvider transporterProvider, RepositoryLayoutProvider layoutProvider, ChecksumPolicyProvider checksumPolicyProvider, FileProcessor fileProcessor) {
+    CustomRepositoryConnectorFactory(TransporterProvider transporterProvider, RepositoryLayoutProvider layoutProvider, ChecksumPolicyProvider checksumPolicyProvider, FileProcessor fileProcessor, RepositorySystem repositorySystem) {
         factory.setTransporterProvider(transporterProvider);
         factory.setRepositoryLayoutProvider(layoutProvider);
         factory.setChecksumPolicyProvider(checksumPolicyProvider);
         factory.setFileProcessor(fileProcessor);
+        this.repositorySystem = repositorySystem;
     }
 
     public float getPriority() {
@@ -82,6 +93,26 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                             if (!newFile.exists()) {
                                 newFile.getParentFile().mkdirs();
                                 newDownloads.add(i);
+                            }
+                            Dependency compile = new Dependency(i.getArtifact(), "compile");
+                            CollectRequest request = new CollectRequest();
+
+                            try {
+                                CollectResult result = repositorySystem.collectDependencies(session, request);
+                                result.getRoot().accept(new DependencyVisitor() {
+                                    @Override
+                                    public boolean visitEnter(DependencyNode node) {
+                                        System.out.println("DEP: " + node.getDependency());
+                                        return true;
+                                    }
+
+                                    @Override
+                                    public boolean visitLeave(DependencyNode node) {
+                                        return true;
+                                    }
+                                });
+                            } catch (DependencyCollectionException e) {
+                                throw new RuntimeException(e);
                             }
                         } else {
                             newDownloads.add(i);
@@ -124,6 +155,7 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                             Matcher m = Pattern.compile("<version>(.*?)</version>").matcher(pomFile);
                             StringBuffer sb = new StringBuffer();
                             while (m.find()) {
+
                                 m.appendReplacement(sb, "<version>$1" + "-\\$\\$jakarta9\\$\\$</version>");
                             }
                             m.appendTail(sb);
