@@ -3,6 +3,8 @@ package io.quarkus.optimus;
 import org.codehaus.plexus.component.annotations.Component;
 import org.eclipse.aether.RepositorySystem;
 import org.eclipse.aether.RepositorySystemSession;
+import org.eclipse.aether.artifact.Artifact;
+import org.eclipse.aether.artifact.DefaultArtifact;
 import org.eclipse.aether.collection.CollectRequest;
 import org.eclipse.aether.collection.CollectResult;
 import org.eclipse.aether.collection.DependencyCollectionException;
@@ -35,23 +37,25 @@ import javax.xml.transform.Transformer;
 import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PrintStream;
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Component(role = RepositoryConnectorFactory.class, hint = "custom")
 public class CustomRepositoryConnectorFactory implements RepositoryConnectorFactory {
@@ -60,6 +64,10 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
     final BasicRepositoryConnectorFactory factory = new BasicRepositoryConnectorFactory();
 
     final RepositorySystem repositorySystem;
+
+    final OldDependencyManager oldDependencyManager = OldDependencyManager.createDefault();
+
+    final Set<String> noTransformNeeded = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
 
     @Inject
@@ -94,26 +102,6 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                                 newFile.getParentFile().mkdirs();
                                 newDownloads.add(i);
                             }
-                            Dependency compile = new Dependency(i.getArtifact(), "compile");
-                            CollectRequest request = new CollectRequest();
-
-                            try {
-                                CollectResult result = repositorySystem.collectDependencies(session, request);
-                                result.getRoot().accept(new DependencyVisitor() {
-                                    @Override
-                                    public boolean visitEnter(DependencyNode node) {
-                                        System.out.println("DEP: " + node.getDependency());
-                                        return true;
-                                    }
-
-                                    @Override
-                                    public boolean visitLeave(DependencyNode node) {
-                                        return true;
-                                    }
-                                });
-                            } catch (DependencyCollectionException e) {
-                                throw new RuntimeException(e);
-                            }
                         } else {
                             newDownloads.add(i);
                         }
@@ -124,12 +112,17 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                     ArtifactDownload i = entry.getKey();
                     File toTransform = i.getFile();
                     i.setFile(entry.getValue());
-                    i.setArtifact(i.getArtifact().setVersion(i.getArtifact().getVersion() + SUFFIX));
+                    String originalVersion = i.getArtifact().getVersion();
+                    i.setArtifact(i.getArtifact().setVersion(originalVersion + SUFFIX));
                     System.out.println(i.getFile());
                     try {
                         if (i.getArtifact().getExtension().equals("jar")) {
                             entry.getValue().getParentFile().mkdirs();
-                            JakartaTransformer.main(new String[]{toTransform.getAbsolutePath(), entry.getValue().getAbsolutePath()});
+
+                            org.eclipse.transformer.Transformer jTrans = new org.eclipse.transformer.Transformer(new PrintStream(new ByteArrayOutputStream()), new PrintStream(new ByteArrayOutputStream()));
+                            jTrans.setOptionDefaults(JakartaTransformer.class, JakartaTransformer.getOptionDefaults());
+                            jTrans.setArgs(new String[]{toTransform.getAbsolutePath(), entry.getValue().getAbsolutePath()});
+                            jTrans.run();
 
                             URI uri = new URI("jar:" + entry.getValue().toURI().toASCIIString());
                             try (FileSystem zipfs = FileSystems.newFileSystem(uri, new HashMap<>())) {
@@ -150,17 +143,9 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                             }
                         } else if (i.getArtifact().getExtension().equals("pom")) {
                             entry.getValue().getParentFile().mkdirs();
-                            String pomFile = new String(Files.readAllBytes(toTransform.toPath()), StandardCharsets.UTF_8);
-                            modifyPomFile(toTransform, entry.getValue());
-                            Matcher m = Pattern.compile("<version>(.*?)</version>").matcher(pomFile);
-                            StringBuffer sb = new StringBuffer();
-                            while (m.find()) {
-
-                                m.appendReplacement(sb, "<version>$1" + "-\\$\\$jakarta9\\$\\$</version>");
-                            }
-                            m.appendTail(sb);
-                            Files.write(entry.getValue().toPath(), sb.toString().getBytes(StandardCharsets.UTF_8));
-                            //Files.copy(toTransform.toPath(), entry.getValue().toPath());
+                            Artifact artifact = new DefaultArtifact(i.getArtifact().getGroupId(), i.getArtifact().getArtifactId(), i.getArtifact().getExtension(), originalVersion);
+                            List<Artifact> deps = resolveDependencies(artifact, repository, session);
+                            modifyPomFile(toTransform, entry.getValue(), deps, originalVersion);
                         } else {
                             entry.getValue().getParentFile().mkdirs();
                             Files.copy(toTransform.toPath(), entry.getValue().toPath());
@@ -171,8 +156,12 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                 }
             }
 
-            private void modifyPomFile(File source, File target) {
+            private void modifyPomFile(File source, File target, List<Artifact> deps, String currentVersion) {
                 try {
+                    Map<String, String> actualVersionMap = new HashMap<>();
+                    for (Artifact i : deps) {
+                        actualVersionMap.put(i.getGroupId() + ":" + i.getArtifactId(), i.getVersion());
+                    }
 
                     DocumentBuilderFactory documentBuilderFactory = DocumentBuilderFactory.newInstance();
 
@@ -181,7 +170,6 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                     Document document = documentBuilder.parse(source);
 
                     NodeList mainNodes = document.getFirstChild().getChildNodes();
-
                     for (int nc = 0; nc < mainNodes.getLength(); ++nc) {
                         Node node = mainNodes.item(nc);
                         if (node instanceof Element) {
@@ -191,10 +179,10 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                                     handleParent(element);
                                     break;
                                 case "dependencies":
-                                    handleDependencies(element);
+                                    handleDependencies(element, actualVersionMap, currentVersion);
                                     break;
                                 case "dependencyManagement":
-                                    handleDependencies((Element) element.getElementsByTagName("dependencies").item(0));
+                                    handleDependencies((Element) element.getElementsByTagName("dependencies").item(0), actualVersionMap, currentVersion);
                                     break;
 
                             }
@@ -216,7 +204,7 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
 
             }
 
-            private void handleDependencies(Element element) {
+            private void handleDependencies(Element element, Map<String, String> actualVersionMap, String currentVersion) {
                 NodeList deps = element.getElementsByTagName("dependency");
                 for (int nc = 0; nc < deps.getLength(); ++nc) {
                     Element dep = (Element) deps.item(nc);
@@ -226,8 +214,43 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                     Node version = versions.getLength() > 0 ? versions.item(0) : null;
                     String group = groupId.getTextContent();
                     String artifact = artifactId.getTextContent();
-                    if (version != null) {
-                        dep.setTextContent(dep.getTextContent() + SUFFIX);
+                    String resolvedVersion = actualVersionMap.get(group + ":" + artifact);
+                    String versionText = version == null ? null : version.getTextContent();
+                    if (resolvedVersion != null && version != null) {
+                        versionText = resolvedVersion;
+                    }
+                    if ("${project.version}".equals(versionText)) {
+                        versionText = currentVersion;
+                    }
+
+                    String id = group + ":"+ artifact +":" + versionText;
+                    if (noTransformNeeded.contains(id)) {
+                        continue;
+                    }
+                    if (oldDependencyManager.isOldApi(group, artifact, versionText)) {
+                        Artifact replacement = oldDependencyManager.getReplacement(group, artifact);
+                        groupId.setTextContent(replacement.getGroupId());
+                        artifactId.setTextContent(replacement.getArtifactId());
+                        if (version != null) {
+                            version.setTextContent(replacement.getVersion());
+                        }
+                    } else if (version != null) {
+                        if (version.getTextContent().endsWith(SUFFIX)) {
+                            continue;
+                        }
+                        Artifact af = new DefaultArtifact(group, artifact, "jar", versionText);
+                        List<Artifact> resolveDependencies = resolveDependencies(af, repository, session);
+                        {
+                            for (Artifact a : resolveDependencies) {
+                                if (oldDependencyManager.isOldApi(a.getGroupId(), a.getArtifactId(), a.getVersion())) {
+                                    version.setTextContent(versionText + SUFFIX);
+                                    break;
+                                }
+                            }
+                        }
+                        noTransformNeeded.add(id);
+                    } else {
+                        noTransformNeeded.add(id);
                     }
                 }
             }
@@ -247,6 +270,31 @@ public class CustomRepositoryConnectorFactory implements RepositoryConnectorFact
                 delegate.close();
             }
         };
+    }
+
+    private List<Artifact> resolveDependencies(org.eclipse.aether.artifact.Artifact i, RemoteRepository repository, RepositorySystemSession session) {
+        Dependency dep = new Dependency(i, "compile");
+        CollectRequest request = new CollectRequest(dep, Collections.singletonList(repository));
+
+        List<Artifact> ret = new ArrayList<>();
+        try {
+            CollectResult result = repositorySystem.collectDependencies(session, request);
+            result.getRoot().accept(new DependencyVisitor() {
+                @Override
+                public boolean visitEnter(DependencyNode node) {
+                    ret.add(node.getArtifact());
+                    return true;
+                }
+
+                @Override
+                public boolean visitLeave(DependencyNode node) {
+                    return true;
+                }
+            });
+        } catch (DependencyCollectionException e) {
+            throw new RuntimeException(e);
+        }
+        return ret;
     }
 
 
